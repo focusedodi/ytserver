@@ -1,2 +1,6 @@
-flask==3.0.3
-yt-dlp
+Flask==3.0.3
+gunicorn==22.0.0
+# Sin version fija a proposito: YouTube rompe yt-dlp seguido y quieres
+# la ultima version en cada redeploy. "[default]" incluye yt-dlp-ejs,
+# necesario para resolver los challenges de JS de YouTube.
+yt-dlp[default]
