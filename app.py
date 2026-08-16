@@ -37,7 +37,7 @@ def debug_formats():
         "skip_download": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web", "tv"],
+                "player_client": ["android", "ios", "web"],
             }
         },
     }
