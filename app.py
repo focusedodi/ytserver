@@ -1,7 +1,8 @@
 import os
 import shutil
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response, stream_with_context
+import requests as http_requests
 import yt_dlp
 
 app = Flask(__name__)
@@ -219,6 +220,95 @@ def get_audio():
 
     except Exception as e:
         return jsonify({"error": str(e), "cookies_info": cookies_info}), 500
+
+
+@app.route("/stream", methods=["GET"])
+def stream_audio():
+    """Proxy real de audio para Alexa.
+
+    Por que existe este endpoint y no basta con /audio:
+    1. La URL que devuelve /audio esta atada a la IP de este servidor
+       (googlevideo.com valida el parametro 'ip='). Si se la das
+       directo a Alexa, sus servidores la piden desde otra IP y
+       YouTube la rechaza. Aqui el audio pasa POR este servidor, asi
+       que la IP siempre es la correcta.
+    2. Alexa AudioPlayer solo soporta MP3/AAC, no webm/opus. Aqui
+       forzamos preferencia por m4a (audio AAC).
+    3. Alexa no manda headers personalizados al pedir el audio, asi
+       que el token se acepta tambien por query string (?token=...).
+    """
+    token = request.args.get("token", "") or request.headers.get("X-API-Token", "")
+    if token != API_TOKEN:
+        return jsonify({"error": "unauthorized"}), 401
+
+    query = request.args.get("q")
+    video_id = request.args.get("video_id")
+    if not query and not video_id:
+        return jsonify({"error": "falta 'q' o 'video_id'"}), 400
+
+    target = f"https://www.youtube.com/watch?v={video_id}" if video_id else f"ytsearch1:{query}"
+
+    cookies_info = refresh_tmp_cookies()
+    base_opts = build_base_opts(cookies_info)
+    # Preferimos m4a (AAC) porque es lo que Alexa AudioPlayer soporta bien.
+    base_opts["format"] = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio/best"
+
+    try:
+        info, client_usado, intentos_fallidos = extract_with_fallback(target, base_opts)
+        if "entries" in info:
+            if not info["entries"]:
+                return jsonify({"error": "sin resultados"}), 404
+            info = info["entries"][0]
+
+        chosen = None
+        for f in info.get("formats", []):
+            if f.get("acodec", "none") != "none" and f.get("url"):
+                if f.get("ext") == "m4a":
+                    chosen = f
+                    break
+                if chosen is None:
+                    chosen = f
+        if chosen is None:
+            return jsonify({"error": "no se encontro stream de audio"}), 404
+
+        upstream_url = chosen["url"]
+        content_type = "audio/mp4" if chosen.get("ext") == "m4a" else f"audio/{chosen.get('ext', 'webm')}"
+
+        # Reenviamos el header Range si Alexa lo manda (para buscar/bufferear).
+        upstream_headers = {}
+        range_header = request.headers.get("Range")
+        if range_header:
+            upstream_headers["Range"] = range_header
+
+        upstream = http_requests.get(
+            upstream_url, headers=upstream_headers, stream=True, timeout=30
+        )
+
+        def generate():
+            try:
+                for chunk in upstream.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                upstream.close()
+
+        resp_headers = {"Accept-Ranges": "bytes"}
+        if upstream.headers.get("Content-Length"):
+            resp_headers["Content-Length"] = upstream.headers["Content-Length"]
+        if upstream.headers.get("Content-Range"):
+            resp_headers["Content-Range"] = upstream.headers["Content-Range"]
+
+        status = 206 if (range_header and upstream.status_code == 206) else 200
+
+        return Response(
+            stream_with_context(generate()),
+            status=status,
+            headers=resp_headers,
+            mimetype=content_type,
+        )
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
