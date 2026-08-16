@@ -19,6 +19,66 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/debug", methods=["GET"])
+def debug_formats():
+    if not check_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    query = request.args.get("q")
+    video_id = request.args.get("video_id")
+    if not query and not video_id:
+        return jsonify({"error": "falta 'q' o 'video_id'"}), 400
+
+    target = f"https://www.youtube.com/watch?v={video_id}" if video_id else f"ytsearch1:{query}"
+
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web", "tv"],
+            }
+        },
+    }
+
+    secret_cookies_path = "/etc/secrets/cookies.txt"
+    tmp_cookies_path = "/tmp/cookies.txt"
+    if os.path.exists(secret_cookies_path):
+        if not os.path.exists(tmp_cookies_path):
+            shutil.copyfile(secret_cookies_path, tmp_cookies_path)
+        ydl_opts["cookiefile"] = tmp_cookies_path
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+            if "entries" in info:
+                if not info["entries"]:
+                    return jsonify({"error": "sin resultados"}), 404
+                info = info["entries"][0]
+
+            formats = info.get("formats", [])
+            resumen = [
+                {
+                    "format_id": f.get("format_id"),
+                    "ext": f.get("ext"),
+                    "acodec": f.get("acodec"),
+                    "vcodec": f.get("vcodec"),
+                    "abr": f.get("abr"),
+                    "protocol": f.get("protocol"),
+                }
+                for f in formats
+            ]
+            return jsonify({
+                "video_id": info.get("id"),
+                "title": info.get("title"),
+                "total_formats": len(formats),
+                "formats": resumen,
+            })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/audio", methods=["GET"])
 def get_audio():
     if not check_auth(request):
