@@ -33,7 +33,7 @@ def get_audio():
     target = f"https://www.youtube.com/watch?v={video_id}" if video_id else f"ytsearch1:{query}"
 
     ydl_opts = {
-        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "format": "bestaudio/best",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
@@ -53,6 +53,7 @@ def get_audio():
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target, download=False)
+            # Si venía de búsqueda, coge el primer resultado
             if "entries" in info:
                 if not info["entries"]:
                     return jsonify({"error": "sin resultados"}), 404
@@ -60,6 +61,7 @@ def get_audio():
 
             audio_url = info.get("url")
             if not audio_url:
+                # Buscar en 'formats' si no vino directo
                 for f in info.get("formats", []):
                     if f.get("acodec") != "none" and f.get("url"):
                         audio_url = f["url"]
