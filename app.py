@@ -1,17 +1,86 @@
 import os
 import shutil
+import logging
 from flask import Flask, request, jsonify
 import yt_dlp
 
 app = Flask(__name__)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Token simple para que no cualquiera use tu servidor gratis
 API_TOKEN = os.environ.get("API_TOKEN", "cambia-esto-por-algo-secreto")
+
+SECRET_COOKIES_PATH = "/etc/secrets/cookies.txt"
+TMP_COOKIES_PATH = "/tmp/cookies.txt"
+
+# Distintas combinaciones de "cliente" que yt-dlp puede simular.
+# Probamos varias en orden porque YouTube va bloqueando unas y otras
+# van cambiando de efectividad casi cada semana.
+PLAYER_CLIENT_ATTEMPTS = [
+    ["ios"],
+    ["android"],
+    ["web_creator"],
+    ["android", "web"],
+    ["web"],
+]
 
 
 def check_auth(req):
     token = req.headers.get("X-API-Token", "")
     return token == API_TOKEN
+
+
+def refresh_tmp_cookies():
+    """Copia siempre el cookies.txt del Secret File a /tmp (que sí es escribible).
+    Antes solo se copiaba si /tmp/cookies.txt no existia todavia, lo que
+    hacia que si subias un cookies.txt nuevo, el servidor siguiera usando
+    el viejo hasta que Render reiniciara el contenedor por su cuenta.
+    """
+    cookies_info = {
+        "secret_file_existe": os.path.exists(SECRET_COOKIES_PATH),
+    }
+    if os.path.exists(SECRET_COOKIES_PATH):
+        cookies_info["secret_file_tamano_bytes"] = os.path.getsize(SECRET_COOKIES_PATH)
+        try:
+            shutil.copyfile(SECRET_COOKIES_PATH, TMP_COOKIES_PATH)
+            cookies_info["cookiefile_usado"] = TMP_COOKIES_PATH
+        except Exception as e:
+            cookies_info["error_copiando_cookies"] = str(e)
+    return cookies_info
+
+
+def build_base_opts(cookies_info):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    if cookies_info.get("cookiefile_usado"):
+        opts["cookiefile"] = cookies_info["cookiefile_usado"]
+    return opts
+
+
+def extract_with_fallback(target, base_opts):
+    """Intenta extraer info probando distintos player_client en orden.
+    Devuelve (info, client_usado) o lanza la ultima excepcion si todos fallan.
+    """
+    last_error = None
+    for clients in PLAYER_CLIENT_ATTEMPTS:
+        opts = dict(base_opts)
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+                logger.info("Exito con player_client=%s", clients)
+                return info, clients
+        except Exception as e:
+            logger.warning("Fallo con player_client=%s -> %s", clients, e)
+            last_error = e
+            continue
+    raise last_error
 
 
 @app.route("/health", methods=["GET"])
@@ -31,56 +100,36 @@ def debug_formats():
 
     target = f"https://www.youtube.com/watch?v={video_id}" if video_id else f"ytsearch1:{query}"
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
-    }
-
-    secret_cookies_path = "/etc/secrets/cookies.txt"
-    tmp_cookies_path = "/tmp/cookies.txt"
-    cookies_info = {
-        "secret_file_existe": os.path.exists(secret_cookies_path),
-        "tmp_file_existe": os.path.exists(tmp_cookies_path),
-    }
-    if os.path.exists(secret_cookies_path):
-        cookies_info["secret_file_tamano_bytes"] = os.path.getsize(secret_cookies_path)
-        shutil.copyfile(secret_cookies_path, tmp_cookies_path)
-        ydl_opts["cookiefile"] = tmp_cookies_path
-        cookies_info["cookiefile_usado"] = tmp_cookies_path
+    cookies_info = refresh_tmp_cookies()
+    base_opts = build_base_opts(cookies_info)
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-            if "entries" in info:
-                if not info["entries"]:
-                    return jsonify({"error": "sin resultados"}), 404
-                info = info["entries"][0]
+        info, client_usado = extract_with_fallback(target, base_opts)
+        if "entries" in info:
+            if not info["entries"]:
+                return jsonify({"error": "sin resultados"}), 404
+            info = info["entries"][0]
 
-            formats = info.get("formats", [])
-            resumen = [
-                {
-                    "format_id": f.get("format_id"),
-                    "ext": f.get("ext"),
-                    "acodec": f.get("acodec"),
-                    "vcodec": f.get("vcodec"),
-                    "abr": f.get("abr"),
-                    "protocol": f.get("protocol"),
-                }
-                for f in formats
-            ]
-            return jsonify({
-                "video_id": info.get("id"),
-                "title": info.get("title"),
-                "total_formats": len(formats),
-                "formats": resumen,
-                "cookies_info": cookies_info,
-            })
+        formats = info.get("formats", [])
+        resumen = [
+            {
+                "format_id": f.get("format_id"),
+                "ext": f.get("ext"),
+                "acodec": f.get("acodec"),
+                "vcodec": f.get("vcodec"),
+                "abr": f.get("abr"),
+                "protocol": f.get("protocol"),
+            }
+            for f in formats
+        ]
+        return jsonify({
+            "video_id": info.get("id"),
+            "title": info.get("title"),
+            "total_formats": len(formats),
+            "formats": resumen,
+            "player_client_usado": client_usado,
+            "cookies_info": cookies_info,
+        })
     except Exception as e:
         return jsonify({"error": str(e), "cookies_info": cookies_info}), 500
 
@@ -98,57 +147,38 @@ def get_audio():
 
     target = f"https://www.youtube.com/watch?v={video_id}" if video_id else f"ytsearch1:{query}"
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
-    }
-
-    # Si subiste un cookies.txt como Secret File en Render, se usa automáticamente.
-    # Render monta los Secret Files como solo-lectura, pero yt-dlp necesita poder
-    # escribir el archivo de cookies, así que lo copiamos a /tmp (sí es escribible).
-    secret_cookies_path = "/etc/secrets/cookies.txt"
-    tmp_cookies_path = "/tmp/cookies.txt"
-    if os.path.exists(secret_cookies_path):
-        shutil.copyfile(secret_cookies_path, tmp_cookies_path)
-        ydl_opts["cookiefile"] = tmp_cookies_path
+    cookies_info = refresh_tmp_cookies()
+    base_opts = build_base_opts(cookies_info)
+    base_opts["format"] = "bestaudio/best"
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-            # Si venía de búsqueda, coge el primer resultado
-            if "entries" in info:
-                if not info["entries"]:
-                    return jsonify({"error": "sin resultados"}), 404
-                info = info["entries"][0]
+        info, client_usado = extract_with_fallback(target, base_opts)
 
-            audio_url = info.get("url")
-            if not audio_url:
-                # Buscar en 'formats' si no vino directo
-                for f in info.get("formats", []):
-                    if f.get("acodec") != "none" and f.get("url"):
-                        audio_url = f["url"]
-                        break
+        if "entries" in info:
+            if not info["entries"]:
+                return jsonify({"error": "sin resultados"}), 404
+            info = info["entries"][0]
 
-            if not audio_url:
-                return jsonify({"error": "no se encontró stream de audio"}), 404
+        audio_url = info.get("url")
+        if not audio_url:
+            for f in info.get("formats", []):
+                if f.get("acodec") != "none" and f.get("url"):
+                    audio_url = f["url"]
+                    break
 
-            return jsonify({
-                "video_id": info.get("id"),
-                "title": info.get("title"),
-                "audio_url": audio_url,
-                "duration": info.get("duration"),
-            })
+        if not audio_url:
+            return jsonify({"error": "no se encontro stream de audio", "cookies_info": cookies_info}), 404
+
+        return jsonify({
+            "video_id": info.get("id"),
+            "title": info.get("title"),
+            "audio_url": audio_url,
+            "duration": info.get("duration"),
+            "player_client_usado": client_usado,
+        })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "cookies_info": cookies_info}), 500
 
 
 if __name__ == "__main__":
