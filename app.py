@@ -15,10 +15,21 @@ API_TOKEN = os.environ.get("API_TOKEN", "cambia-esto-por-algo-secreto")
 SECRET_COOKIES_PATH = "/etc/secrets/cookies.txt"
 TMP_COOKIES_PATH = "/tmp/cookies.txt"
 
+# Runtime de JS que yt-dlp usa para resolver los challenges de YouTube.
+# Desde finales de 2025 esto es obligatorio para que YouTube entregue
+# formatos reales (si no, aunque cookies y player_client estén bien,
+# revienta con "Requested format is not available").
+# Se puede sobreescribir con la env var JS_RUNTIME si el binario de Deno
+# vive en otra ruta.
+JS_RUNTIME_PATH = os.environ.get("JS_RUNTIME_PATH", "deno")
+
 # Distintas combinaciones de "cliente" que yt-dlp puede simular.
 # Probamos varias en orden porque YouTube va bloqueando unas y otras
-# van cambiando de efectividad casi cada semana.
+# van cambiando de efectividad casi cada semana. "tv" y "default" se
+# agregaron porque son las que mejor sobreviven a los cambios de 2026.
 PLAYER_CLIENT_ATTEMPTS = [
+    ["default"],
+    ["tv"],
     ["ios"],
     ["android"],
     ["web_creator"],
@@ -33,16 +44,16 @@ def check_auth(req):
 
 
 def refresh_tmp_cookies():
-    """Copia siempre el cookies.txt del Secret File a /tmp (que sí es escribible).
-    Antes solo se copiaba si /tmp/cookies.txt no existia todavia, lo que
-    hacia que si subias un cookies.txt nuevo, el servidor siguiera usando
-    el viejo hasta que Render reiniciara el contenedor por su cuenta.
-    """
+    """Copia siempre el cookies.txt del Secret File a /tmp (que sí es escribible)."""
     cookies_info = {
         "secret_file_existe": os.path.exists(SECRET_COOKIES_PATH),
     }
     if os.path.exists(SECRET_COOKIES_PATH):
-        cookies_info["secret_file_tamano_bytes"] = os.path.getsize(SECRET_COOKIES_PATH)
+        stat = os.stat(SECRET_COOKIES_PATH)
+        cookies_info["secret_file_tamano_bytes"] = stat.st_size
+        cookies_info["secret_file_modificado_hace_segundos"] = int(
+            __import__("time").time() - stat.st_mtime
+        )
         try:
             shutil.copyfile(SECRET_COOKIES_PATH, TMP_COOKIES_PATH)
             cookies_info["cookiefile_usado"] = TMP_COOKIES_PATH
@@ -57,6 +68,11 @@ def build_base_opts(cookies_info):
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        # Le decimos a yt-dlp qué runtime de JS usar para resolver los
+        # challenges de YouTube. Sin esto, muchos formatos vienen sin URL.
+        # OJO: el formato correcto es un dict {runtime: {config}}, una
+        # lista simple hace que yt-dlp falle al instanciar YoutubeDL.
+        "js_runtimes": {"deno": {"path": JS_RUNTIME_PATH} if JS_RUNTIME_PATH != "deno" else {}},
     }
     if cookies_info.get("cookiefile_usado"):
         opts["cookiefile"] = cookies_info["cookiefile_usado"]
@@ -65,9 +81,12 @@ def build_base_opts(cookies_info):
 
 def extract_with_fallback(target, base_opts):
     """Intenta extraer info probando distintos player_client en orden.
-    Devuelve (info, client_usado) o lanza la ultima excepcion si todos fallan.
+    Devuelve (info, client_usado, errores_por_intento).
+    Si todos fallan, lanza una excepcion con el detalle de cada intento
+    (antes solo se veia el error del ultimo, lo que hacia el debug casi
+    imposible).
     """
-    last_error = None
+    errors = {}
     for clients in PLAYER_CLIENT_ATTEMPTS:
         opts = dict(base_opts)
         opts["extractor_args"] = {"youtube": {"player_client": clients}}
@@ -75,17 +94,33 @@ def extract_with_fallback(target, base_opts):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(target, download=False)
                 logger.info("Exito con player_client=%s", clients)
-                return info, clients
+                return info, clients, errors
         except Exception as e:
             logger.warning("Fallo con player_client=%s -> %s", clients, e)
-            last_error = e
+            errors[",".join(clients)] = str(e)
             continue
-    raise last_error
+    raise RuntimeError(f"Todos los player_client fallaron: {errors}")
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
+
+
+@app.route("/version", methods=["GET"])
+def version():
+    """Util para confirmar en produccion que version de yt-dlp esta
+    corriendo y si Deno (el runtime de JS) esta disponible."""
+    if not check_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    deno_path = shutil.which(JS_RUNTIME_PATH)
+    return jsonify({
+        "yt_dlp_version": yt_dlp.version.__version__,
+        "js_runtime_configurado": JS_RUNTIME_PATH,
+        "js_runtime_encontrado_en": deno_path,
+        "js_runtime_disponible": deno_path is not None,
+    })
 
 
 @app.route("/debug", methods=["GET"])
@@ -104,7 +139,7 @@ def debug_formats():
     base_opts = build_base_opts(cookies_info)
 
     try:
-        info, client_usado = extract_with_fallback(target, base_opts)
+        info, client_usado, intentos_fallidos = extract_with_fallback(target, base_opts)
         if "entries" in info:
             if not info["entries"]:
                 return jsonify({"error": "sin resultados"}), 404
@@ -128,6 +163,7 @@ def debug_formats():
             "total_formats": len(formats),
             "formats": resumen,
             "player_client_usado": client_usado,
+            "intentos_fallidos_antes_de_exito": intentos_fallidos,
             "cookies_info": cookies_info,
         })
     except Exception as e:
@@ -152,7 +188,7 @@ def get_audio():
     base_opts["format"] = "bestaudio/best"
 
     try:
-        info, client_usado = extract_with_fallback(target, base_opts)
+        info, client_usado, intentos_fallidos = extract_with_fallback(target, base_opts)
 
         if "entries" in info:
             if not info["entries"]:
@@ -167,7 +203,11 @@ def get_audio():
                     break
 
         if not audio_url:
-            return jsonify({"error": "no se encontro stream de audio", "cookies_info": cookies_info}), 404
+            return jsonify({
+                "error": "no se encontro stream de audio",
+                "cookies_info": cookies_info,
+                "intentos_fallidos": intentos_fallidos,
+            }), 404
 
         return jsonify({
             "video_id": info.get("id"),
