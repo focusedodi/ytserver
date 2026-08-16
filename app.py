@@ -50,8 +50,7 @@ def debug_formats():
     }
     if os.path.exists(secret_cookies_path):
         cookies_info["secret_file_tamano_bytes"] = os.path.getsize(secret_cookies_path)
-        if not os.path.exists(tmp_cookies_path):
-            shutil.copyfile(secret_cookies_path, tmp_cookies_path)
+        shutil.copyfile(secret_cookies_path, tmp_cookies_path)
         ydl_opts["cookiefile"] = tmp_cookies_path
         cookies_info["cookiefile_usado"] = tmp_cookies_path
 
@@ -118,8 +117,7 @@ def get_audio():
     secret_cookies_path = "/etc/secrets/cookies.txt"
     tmp_cookies_path = "/tmp/cookies.txt"
     if os.path.exists(secret_cookies_path):
-        if not os.path.exists(tmp_cookies_path):
-            shutil.copyfile(secret_cookies_path, tmp_cookies_path)
+        shutil.copyfile(secret_cookies_path, tmp_cookies_path)
         ydl_opts["cookiefile"] = tmp_cookies_path
 
     try:
