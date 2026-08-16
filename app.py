@@ -38,6 +38,11 @@ def get_audio():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"],
+            }
+        },
     }
 
     # Si subiste un cookies.txt como Secret File en Render, se usa automáticamente.
