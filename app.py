@@ -39,10 +39,14 @@ def get_audio():
         "skip_download": True,
     }
 
+    # Si subiste un cookies.txt como Secret File en Render, se usa automáticamente
+    cookies_path = "/etc/secrets/cookies.txt"
+    if os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(target, download=False)
-            # Si venía de búsqueda, coge el primer resultado
             if "entries" in info:
                 if not info["entries"]:
                     return jsonify({"error": "sin resultados"}), 404
@@ -50,7 +54,6 @@ def get_audio():
 
             audio_url = info.get("url")
             if not audio_url:
-                # Buscar en 'formats' si no vino directo
                 for f in info.get("formats", []):
                     if f.get("acodec") != "none" and f.get("url"):
                         audio_url = f["url"]
