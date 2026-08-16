@@ -1,4 +1,5 @@
 import os
+import shutil
 from flask import Flask, request, jsonify
 import yt_dlp
 
@@ -39,10 +40,15 @@ def get_audio():
         "skip_download": True,
     }
 
-    # Si subiste un cookies.txt como Secret File en Render, se usa automáticamente
-    cookies_path = "/etc/secrets/cookies.txt"
-    if os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
+    # Si subiste un cookies.txt como Secret File en Render, se usa automáticamente.
+    # Render monta los Secret Files como solo-lectura, pero yt-dlp necesita poder
+    # escribir el archivo de cookies, así que lo copiamos a /tmp (sí es escribible).
+    secret_cookies_path = "/etc/secrets/cookies.txt"
+    tmp_cookies_path = "/tmp/cookies.txt"
+    if os.path.exists(secret_cookies_path):
+        if not os.path.exists(tmp_cookies_path):
+            shutil.copyfile(secret_cookies_path, tmp_cookies_path)
+        ydl_opts["cookiefile"] = tmp_cookies_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
