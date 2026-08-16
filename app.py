@@ -44,10 +44,16 @@ def debug_formats():
 
     secret_cookies_path = "/etc/secrets/cookies.txt"
     tmp_cookies_path = "/tmp/cookies.txt"
+    cookies_info = {
+        "secret_file_existe": os.path.exists(secret_cookies_path),
+        "tmp_file_existe": os.path.exists(tmp_cookies_path),
+    }
     if os.path.exists(secret_cookies_path):
+        cookies_info["secret_file_tamano_bytes"] = os.path.getsize(secret_cookies_path)
         if not os.path.exists(tmp_cookies_path):
             shutil.copyfile(secret_cookies_path, tmp_cookies_path)
         ydl_opts["cookiefile"] = tmp_cookies_path
+        cookies_info["cookiefile_usado"] = tmp_cookies_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -74,9 +80,10 @@ def debug_formats():
                 "title": info.get("title"),
                 "total_formats": len(formats),
                 "formats": resumen,
+                "cookies_info": cookies_info,
             })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e), "cookies_info": cookies_info}), 500
 
 
 @app.route("/audio", methods=["GET"])
